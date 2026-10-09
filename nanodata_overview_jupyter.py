@@ -22,6 +22,11 @@ from IPython.core.interactiveshell import InteractiveShell
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
+# 常量定义
+CONSTANT_REGION_THRESHOLD = 0.1  # 检测常量区域的阈值（10%的像素）
+EPSILON = 1e-10  # 浮点数比较的精度
+DEFAULT_PERCENTILE_RANGE = (2, 98)  # 默认百分位范围
+
 # 尝试导入必要的库
 try:
     import nanonispy2 as nap
@@ -38,6 +43,77 @@ except ImportError:
     GWYFILE_AVAILABLE = False
     print("注意: 未找到gwyfile库，无法处理.gwy文件")
     print("安装: pip install gwyfile")
+
+def preprocess_image_data(data: np.ndarray, percentile_range: Tuple[float, float] = DEFAULT_PERCENTILE_RANGE) -> np.ndarray:
+    """
+    预处理图像数据以处理未扫描区域和尖锐变化
+    Preprocess image data to handle unscanned areas and sharp changes
+    
+    参数 / Parameters:
+        data: 原始图像数据 / Raw image data
+        percentile_range: 用于稳健归一化的百分位范围 / Percentile range for robust normalization
+            
+    返回 / Returns:
+        处理后的数据 / Processed data
+    """
+    if data is None or data.size == 0:
+        return data
+    
+    # 验证百分位范围
+    if (percentile_range[0] < 0 or percentile_range[1] > 100 or 
+        percentile_range[0] >= percentile_range[1]):
+        raise ValueError(f"Invalid percentile_range: {percentile_range}. "
+                        f"Must be (low, high) with 0 <= low < high <= 100")
+    
+    # 创建数据副本以避免修改原始数据
+    processed_data = data.copy()
+    
+    # 处理NaN值 - 如果所有值都是NaN，返回全零数组
+    if np.isnan(processed_data).any():
+        if np.isnan(processed_data).all():
+            processed_data = np.zeros_like(processed_data)
+        else:
+            processed_data = np.nan_to_num(processed_data, nan=np.nanmedian(processed_data))
+    
+    # 检测并处理常量区域（未扫描区域）
+    # 如果数据中有大量相同的值（比如0），这些可能是未扫描区域
+    unique_values, counts = np.unique(processed_data, return_counts=True)
+    total_pixels = processed_data.size
+    
+    # 如果某个值占据超过阈值的像素，认为它可能是未扫描区域的填充值
+    mask = None
+    for value, count in zip(unique_values, counts):
+        if count / total_pixels > CONSTANT_REGION_THRESHOLD:
+            # 创建掩码，排除这些常量区域
+            # 使用np.isclose处理浮点数比较
+            if mask is None:
+                mask = ~np.isclose(processed_data, value, rtol=EPSILON, atol=EPSILON)
+            else:
+                mask = mask & ~np.isclose(processed_data, value, rtol=EPSILON, atol=EPSILON)
+    
+    # 如果找到了常量区域，使用掩码计算百分位数
+    # 确保掩码后有足够的有效数据（至少10个像素）
+    if mask is not None and mask.sum() > 10:
+        valid_data = processed_data[mask]
+    else:
+        valid_data = processed_data.flatten()
+    
+    # 使用百分位数进行稳健归一化，避免异常值影响
+    if len(valid_data) > 0:
+        vmin = np.percentile(valid_data, percentile_range[0])
+        vmax = np.percentile(valid_data, percentile_range[1])
+        
+        # 避免vmin == vmax的情况
+        if vmax - vmin < EPSILON:
+            vmin = np.min(valid_data)
+            vmax = np.max(valid_data)
+            if vmax - vmin < EPSILON:
+                vmax = vmin + 1.0
+        
+        # 裁剪数据到百分位范围，避免极端值影响可视化
+        processed_data = np.clip(processed_data, vmin, vmax)
+    
+    return processed_data
 
 class JupyterNanoDataOverviewGenerator:
     """Jupyter环境下的纳米数据概览图生成器"""
@@ -389,13 +465,27 @@ class JupyterNanoDataOverviewGenerator:
             fig_height = rows * figsize_per_img[1]
             fig = plt.figure(figsize=(fig_width, fig_height), dpi=150)
             
+            # 预处理所有图像以获得一致的颜色范围
+            processed_images = [preprocess_image_data(img) for img in current_images]
+            
+            # 计算所有预处理图像的全局最小值和最大值以保持颜色一致性
+            # 使用np.concatenate提高性能
+            valid_arrays = [img.flatten() for img in processed_images if img is not None and img.size > 0]
+            if valid_arrays:
+                all_valid_data = np.concatenate(valid_arrays)
+                global_vmin = np.min(all_valid_data)
+                global_vmax = np.max(all_valid_data)
+            else:
+                global_vmin, global_vmax = 0, 1
+            
             # 添加子图
-            for i, (img_data, filename) in enumerate(zip(current_images, current_names)):
+            for i, (img_data, filename) in enumerate(zip(processed_images, current_names)):
                 ax = plt.subplot(rows, cols, i + 1)
                 
                 if img_data is not None and len(img_data.shape) == 2:
                     im = ax.imshow(img_data, cmap='viridis', aspect='auto', 
-                                  interpolation='nearest', origin='lower')
+                                  interpolation='nearest', origin='lower',
+                                  vmin=global_vmin, vmax=global_vmax)
                     
                     # 只在第一个子图添加颜色条
                     if i == 0:
@@ -603,12 +693,26 @@ class NanoDataOverviewGenerator:
             fig_height = rows * self.figsize_per_img[1]
             fig = plt.figure(figsize=(fig_width, fig_height), dpi=150)
             
-            for i, (img_data, filename) in enumerate(zip(current_images, current_names)):
+            # 预处理所有图像以获得一致的颜色范围
+            processed_images = [preprocess_image_data(img) for img in current_images]
+            
+            # 计算所有预处理图像的全局最小值和最大值以保持颜色一致性
+            # 使用np.concatenate提高性能
+            valid_arrays = [img.flatten() for img in processed_images if img is not None and img.size > 0]
+            if valid_arrays:
+                all_valid_data = np.concatenate(valid_arrays)
+                global_vmin = np.min(all_valid_data)
+                global_vmax = np.max(all_valid_data)
+            else:
+                global_vmin, global_vmax = 0, 1
+            
+            for i, (img_data, filename) in enumerate(zip(processed_images, current_names)):
                 ax = plt.subplot(rows, cols, i + 1)
                 
                 if img_data is not None and len(img_data.shape) == 2:
                     im = ax.imshow(img_data, cmap='afmhot', aspect='auto',
-                                  interpolation='nearest', origin='lower')
+                                  interpolation='nearest', origin='lower',
+                                  vmin=global_vmin, vmax=global_vmax)
                     
                     if i == 0:
                         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
